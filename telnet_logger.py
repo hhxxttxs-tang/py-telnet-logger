@@ -25,11 +25,12 @@ import time
 import optparse
 import os
 import os.path
-import ConfigParser
+import configparser
 import getpass
 import signal
 import socket
 import re
+from datetime import datetime
 
 
 class BaseConfig:
@@ -38,8 +39,8 @@ class BaseConfig:
         self.port = 23
         self.user = getpass.getuser()
         self.password = None
-        self.login_prompt = "ogin:"
-        self.password_prompt = "assword:"
+        self.login_prompt = "login:"
+        self.password_prompt = "Password:"
         self.logged_phrase = None
         self.timeout = 5
         self.reconnect_delay = 5
@@ -47,6 +48,7 @@ class BaseConfig:
         self.sig_usr2_cmd = None
         self.initial_cmd = None
         self.initial_cmd_error_phrase = None
+        self.session_timer = 10000
 
 
 class Config(BaseConfig):
@@ -58,7 +60,7 @@ class Config(BaseConfig):
         self.filename = None
         self.max_logs = 1
         self.max_log_size = 100000
-        self.cfg = ConfigParser.ConfigParser()
+        self.cfg = configparser.ConfigParser()
         self.wd_cmd = None
         self.wd_start_after_delay = None
         self.wd_start_after_phrase = None
@@ -86,6 +88,7 @@ class Config(BaseConfig):
         self.load_cfg_param("user", section=section)
         self.load_cfg_param("password", section=section)
         self.load_cfg_param("filename", section=section)
+        self.load_cfg_param("file_dir", section=section)
         self.load_cfg_param_int("max_logs", section=section)
         self.load_cfg_param_int("max_log_size", section=section)
         self.load_cfg_param("login_prompt", section=section)
@@ -103,6 +106,8 @@ class Config(BaseConfig):
         self.load_cfg_param_int("reconnect_delay", section=section)
         self.load_cfg_param("initial_cmd", section=section)
         self.load_cfg_param("initial_cmd_error_phrase", section=section)
+        self.load_cfg_param_int("session_timer", section=section)
+
 
     def load_from_file(self, file_name):
         if self.cfg.read(file_name) == [file_name]:
@@ -128,16 +133,16 @@ class Authenticator:
 
     def authenticate(self):
         if self.cfg.login_prompt:
-            self.debug("waiting for login prompt...")
+            self.debug(f'waiting for login prompt("{self.cfg.login_prompt}")...')
             line = self.telnet_base.expect_line(self.cfg.login_prompt)
-            self.debug("Sending login name...")
+            self.debug(f'Sending login name("{self.cfg.user}")...')
             self.telnet_base.write_line(self.cfg.user + "\n")
-            self.debug("waiting for password prompt...")
+            self.debug(f'waiting for password prompt("{self.cfg.password_prompt}")...')
             line = self.telnet_base.expect_line(self.cfg.password_prompt)
-            self.debug("Sending password...")
+            self.debug(f'Sending password("{self.cfg.password}")...')
             self.telnet_base.write_line(self.cfg.password + "\n")
         if self.cfg.logged_phrase:
-            self.debug("waiting for logged in phrase")
+            self.debug(f"waiting for logged in phrase({self.cfg.logged_phrase})")
             self.telnet_base.expect_line(self.cfg.logged_phrase, timeout=self.cfg.timeout * 5)
             self.debug("logged in")
 
@@ -237,17 +242,19 @@ class TelnetBase:
     def expect_line(self, line_expected, timeout=DEFAULT_TIMEOUT):
         if timeout == DEFAULT_TIMEOUT:
             timeout = self.default_timeout
-        index, match, line = self.telnet.expect(list=[line_expected], timeout=timeout)
-        # self.debug("line received: {}".format(line))
+        index, match, line = self.telnet.expect(list=[line_expected.encode()], timeout=timeout)
         if index < 0:
+            # self.info("line received: {}".format(line))
+            self.info(f'expected string not arriving, the received response >>>{line.decode()}<<<')
             raise TimeoutException()
+        self.info(f'Got expected string, the received response >>>{line.decode()}<<<')
         return line
 
     def write_line(self, line):
-        self.telnet.write(line)
+        self.telnet.write(line.encode())
 
     def writeln_line(self, line):
-        self.telnet.write(line + "\n")
+        self.telnet.write((line + "\n").encode())
 
     def cmd_usr1(self):
         self.signal_pending = True
@@ -281,6 +288,7 @@ class TelnetBase:
             else:
                 cmd = self.cmd_to_send
                 self.cmd_to_send = None
+            self.info(f'send command to telnet:{cmd}')
             self.writeln_line(cmd)
 
     def wait_for_line(self):
@@ -292,6 +300,8 @@ class TelnetBase:
 
     def process_filters(self, line, source=LineSource.REMOTE):
         for f in self.filters.values():
+            # reset reconnect timer by every line received
+            f.reset()
             if not f.filter_line(line, self, source):
                 return False
         return True
@@ -311,11 +321,12 @@ class TelnetBase:
     def __process_remote_data(self):
         try:
             text = self.telnet.read_eager()
+            # self.info(f'read_eager returns={text}, type = {type(text)}')
         except EOFError:
-            print '*** Connection closed by remote host ***'
+            print('*** Connection closed by remote host ***')
             raise
         if text:
-            self.buffer += text
+            self.buffer += text.decode("ISO-8859-1")
             while True:
                 nl_index = self.buffer.find("\n")
                 if nl_index < 0:
@@ -357,7 +368,9 @@ class LoggerListener(LineListener):
         self.logger = logging.getLogger("telnet")
         rfh = RotatingFileHandler(filename=filename, maxBytes=max_bytes, backupCount=backup_count)
         rfh.setLevel(logging.INFO)
-        rfh.setFormatter(logging.Formatter(fmt="%(asctime)s %(message)s"))
+        # rfh.setFormatter(logging.Formatter(fmt="%(asctime)s %(message)s"))
+        formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%m-%d %H:%M:%S')
+        rfh.setFormatter(formatter)
         self.logger.addHandler(rfh)
         self.logger.setLevel(logging.INFO)
 
@@ -411,7 +424,7 @@ class WatchdogListener(LineFilter):
 
     def filter_line(self, line, telnet_base, source=LineSource.REMOTE):
         if source == LineSource.REMOTE and self.patt.match(line):
-            self.reset()
+            # self.reset()
             return False
         return True
 
@@ -460,6 +473,8 @@ def get_cmd_params():
                   help="delay after connection lost/error and retry")
     op.add_option("--filename", dest="filename",
                   help="filename of a log file")
+    op.add_option("--file-dir", dest="file_dir",
+                  help="directory of a log file")
     op.add_option("-c", "--cfg", dest="cfg", help="configuration file (defaults to ~/telnet_logger.ini", default=None)
     opts, args = op.parse_args()
     return opts, args
@@ -472,7 +487,11 @@ class TelnetLogger(TelnetBase):
         self.log_path = conf.filename
         self.has_output = False
         if self.log_path:
-            self.logger_listener = LoggerListener(conf.filename, conf.max_log_size, conf.max_logs)
+            dateTimeObj = datetime.now()
+            timestampStr = dateTimeObj.strftime("%m%d%H%M%S")
+            # log_fn = "./log/" + conf.host + "-" + timestampStr + "_" + self.log_path
+            log_fn = conf.file_dir + "/" + conf.host + "-" + timestampStr + "_" + self.log_path
+            self.logger_listener = LoggerListener(log_fn, conf.max_log_size, conf.max_logs)
             self.add_listener(self.logger_listener)
             self.has_output = True
         # if sys.stdin.isatty():
@@ -501,18 +520,40 @@ def sig_usr2(signum, frame):
         Global.telnet.cmd_usr2()
 
 
+password_db = {}
+with open("password_db.txt") as cmudict:
+    for cur_ln in cmudict:
+        if not cur_ln:
+            continue
+        cur_ln_split = cur_ln.split()
+        # print(cur_ln_split)
+        host = cur_ln_split[0].strip()
+        password = cur_ln_split[1].strip()
+
+        password_db[host] = password
+print(password_db)
+
 def main():
     opts, args = get_cmd_params()
     if not opts.cfg:
-        opts.cfg = os.path.expanduser("~/telnet_logger.ini")
+        opts.cfg = os.path.expanduser("telnet_logger.ini")
     c = Config()
+
     c.load_from_file(opts.cfg)
     c.load_from_command_line(opts)
+
+    # if password is not supplied by configuration file or command line
+    if c.password_prompt and not c.password:
+        if c.host and password_db and c.host in password_db:
+            c.password = password_db[c.host]
+
+    # last resort, user should enter the password manually
     if c.password_prompt and not c.password:
         if not sys.stdin.isatty():
-            print "cannot retrieve password in batch mode!! aborting"
+            print("cannot retrieve password in batch mode!! aborting")
             sys.exit(1)
         c.password = getpass.getpass(prompt="password for telnet session:")
+
     telnet = TelnetLogger(conf=c)
     Global.telnet = telnet
     signal.signal(signal.SIGUSR1, sig_usr1)
@@ -520,19 +561,32 @@ def main():
     local_fd = None
     if sys.stdin.isatty() or True:
         local_fd = sys.stdin
+
+    session_expiration_tm = time.time() + c.session_timer
     while True:
+        if c.session_timer and time.time() > session_expiration_tm:
+            telnet.info(f'telnet session timeout, quit!!\n\n')
+            return
+
         try:
             telnet.connect()
             if telnet.wd:
                 telnet.wd.reset()
             wd_time = time.time()
             while True:
+                if c.session_timer and time.time() > session_expiration_tm:
+                    telnet.info(f'telnet session timeout, quit!!\n\n')
+                    return
+
                 telnet.send_pending_cmd()
                 telnet.process_remote_data(local_fd=local_fd, timeout=4)
                 ctime = time.time()
+                # send keep alive command every c.wd_delay
                 if c.wd_cmd and c.wd_delay and ctime > wd_time + c.wd_delay:
+                    telnet.info(f"watchdog triggered")
                     telnet.watchdog_cmd()
                     wd_time = time.time()
+                # reset the connection if re-connect timer(wd_timeout or wd_max_wait in the configuration) is up
                 if telnet.wd and telnet.wd.is_expired():
                     telnet.error("==========================================================")
                     telnet.error("remote host is not responding. Reconnecting in progress...")
@@ -541,13 +595,11 @@ def main():
                     break
 
         except socket.error as e:
-            telnet.error("error during connection: {} {}. Retrying after {} seconds...", e.__class__, e.strerror,
-                         c.reconnect_delay)
+            telnet.error(f'socket error during connection: {e.__class__}\n{e}. \nRetrying after {c.reconnect_delay} seconds...')
             # raise
             time.sleep(c.reconnect_delay)
         except Exception as e:
-            telnet.error("error during connection: {} {}. Retrying after {} seconds...", e.__class__, e.message,
-                         c.reconnect_delay)
+            telnet.error(f'error during connection: {e.__class__}\n{e}. \nRetrying after {c.reconnect_delay} seconds...')
             # raise
             time.sleep(c.reconnect_delay)
 
